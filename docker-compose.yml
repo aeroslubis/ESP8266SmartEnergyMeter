@@ -1,0 +1,34 @@
+version: "3.0"
+
+services:
+    telegraf:
+        image: telegraf
+        environment:
+            - HOST_PROC=/host/proc
+        privileged: true
+        network_mode: host
+        volumes:
+            - /proc:/host/proc:ro
+            - etc/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+
+    influxdb:
+        image: influxdb
+        ports:
+            - "8086:8086"
+        environment:
+            - INFLUXDB_USER=root
+            - INFLUXDB_PASS=root
+
+    mosquitto:
+        image: eclipse-mosquitto
+        ports:
+            - "1883:1883"
+
+    grafana:
+        image: grafana/grafana
+        environment:
+            - NO_PROXY="influxdb"
+        links:
+            - influxdb
+        ports:
+            - "3000:3000"

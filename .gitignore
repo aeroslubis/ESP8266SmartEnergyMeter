@@ -1,0 +1,4 @@
+.pio
+include/credentials.h
+lib/*
+!lib/.gitkeep
