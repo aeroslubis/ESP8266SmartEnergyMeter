@@ -1,17 +1,8 @@
 version: "3.0"
 
 services:
-    telegraf:
-        image: telegraf
-        environment:
-            - HOST_PROC=/host/proc
-        privileged: true
-        network_mode: host
-        volumes:
-            - /proc:/host/proc:ro
-            - etc/telegraf.conf:/etc/telegraf/telegraf.conf:ro
-
     influxdb:
+        container_name: power_meter_influxdb
         image: influxdb
         ports:
             - "8086:8086"
@@ -19,16 +10,32 @@ services:
             - INFLUXDB_USER=root
             - INFLUXDB_PASS=root
 
+    telegraf:
+        container_name: power_meter_telegraf
+        image: telegraf
+        environment:
+            - HOST_PROC=/host/proc
+        privileged: true
+        network_mode: "service:influxdb"
+        volumes:
+            - /proc:/host/proc:ro
+            - ./etc/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+        depends_on:
+            - influxdb
+
     mosquitto:
+        container_name: power_meter_mosquitto
         image: eclipse-mosquitto
         ports:
             - "1883:1883"
 
     grafana:
+        container_name: power_meter_grafana
         image: grafana/grafana
         environment:
             - NO_PROXY="influxdb"
-        links:
-            - influxdb
+        network_mode: "service:influxdb"
         ports:
             - "3000:3000"
+        depends_on:
+            - telegraf

@@ -148,7 +148,8 @@ void sendDataToDB(void)
 /**
    Just create a random measurement.
 */
-InfluxData measurePower(void) {
+InfluxData measurePower(void)
+{
     int voltage = random(210, 225);
     float current = 0.12;
     float power = voltage * current;
