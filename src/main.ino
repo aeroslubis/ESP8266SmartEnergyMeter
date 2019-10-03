@@ -13,7 +13,7 @@ const char* _update_password = DEFAULT_UPDATE_PASSWORD;
 const char* _mqtt_server = MQTT_SERVER;
 const char* _ntp_server_name = NTP_SERVER_NAME;
 
-const char* _clientId = "ESP8266Client-01";
+const char* _hostname = "ESP8266Client-01";
 
 /*MQTT Topics name*/
 const char* _mqtt_topic_command = "esp8266/energy_meter/command";
