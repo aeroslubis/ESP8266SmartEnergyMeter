@@ -1,25 +1,38 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
-#include <NTPClient.h>
+#include <TimeLib.h>
 #include <ArduinoOTA.h>
-#include <InfluxDb.h>
+#include <PubSubClient.h>
 #include "credentials.h"
 
 const char* _default_ssid = DEFAULT_SSID;
 const char* _default_password = DEFAULT_PASSWORD;
 const char* _update_username = DEFAULT_UPDATE_USERNAME;
 const char* _update_password = DEFAULT_UPDATE_PASSWORD;
-const char* _influxdb_host = INFLUXDB_HOST;
-const char* _influxdb_user = INFLUXDB_USER;
-const char* _influxdb_pass = INFLUXDB_PASS;
+const char* _mqtt_server = MQTT_SERVER;
+const char* _ntp_server_name = NTP_SERVER_NAME;
 
-const long utcOffsetInSeconds = 25200;
+const char* _clientId = "ESP8266Client-01";
+
+/*MQTT Topics name*/
+const char* _mqtt_topic_command = "esp8266/energy_meter/command";
+const char* _mqtt_topic_connected = "esp8266/energy_meter/connected_client";
+const char* _mqtt_topic_values = "esp8266/energy_meter/values";
+
+/*const long utcOffsetInSeconds = 25200;*/
+const int timeZone = 7;
 unsigned long previousMillis;
 
+
+int voltage;
+float current, power;
+int temperature, humidity, pressure, light;
+
+WiFiClient espClient;
 WiFiUDP ntp_udp;
-NTPClient timeClient(ntp_udp, "asia.pool.ntp.org", utcOffsetInSeconds);
-Influxdb influx(_influxdb_host);
+/*NTPClient timeClient(ntp_udp, "asia.pool.ntp.org", utcOffsetInSeconds);*/
+PubSubClient mqtt(espClient);
 
 void setup()
 {
@@ -29,8 +42,8 @@ void setup()
     Serial.print("Connecting to WiFi");
     while(WiFi.status() != WL_CONNECTED)
     {
-        delay ( 500 );
-        Serial.print ( "." );
+        delay (500);
+        Serial.print (".");
     }
     Serial.println(" OK");
 
@@ -38,8 +51,6 @@ void setup()
     Serial.println(WiFi.localIP());
     Serial.print("MAC Address: ");
     Serial.println(WiFi.macAddress().c_str());
-    Serial.print("InfluxDB host: ");
-    Serial.println(_influxdb_host);
 
     Serial.print("Starting mDNS responder...");
     if (!MDNS.begin("esp8266"))
@@ -98,88 +109,211 @@ void setup()
 
     ArduinoOTA.begin();
 
-    timeClient.begin();
+    ntp_udp.begin(1337);
 
-    influx.setDbAuth("esp8266_powermeter", _influxdb_user, _influxdb_pass);
+    /*timeClient.begin();*/
+    setSyncProvider(getNtpTime);
+    setSyncInterval(300);
+
+    mqtt.setServer(_mqtt_server, 1883);
+    mqtt.setCallback(mqtt_callback);
+
+    /*
+     *ESP8266 Builtin LED
+     */
+    pinMode(D4, OUTPUT);
 }
 
 void loop()
 {
     ArduinoOTA.handle();
 
+    if (!mqtt.connected())
+    {
+        mqtt_reconnect();
+    }
+
+    mqtt.loop();
+
     if (millis() > previousMillis + 5000)
     {
         previousMillis = millis();
-        timeClient.update();
-        displayTime();
-        sendDataToDB();
+        digitalClockDisplay();
+        mqtt_publish_topic();
+        Serial.println("----------------------------");
     }
 }
 
-void displayTime()
+void digitalClockDisplay(void)
 {
-    Serial.println("-------Current Time--------");
-    Serial.println(timeClient.getFormattedTime());
-    Serial.println(timeClient.getEpochTime());
-
-    Serial.print(timeClient.getDay());
-    Serial.print(", ");
-    Serial.print(timeClient.getHours());
-    Serial.print(":");
-    Serial.print(timeClient.getMinutes());
-    Serial.print(":");
-    Serial.println(timeClient.getSeconds());
-
-    Serial.println("---------------------------");
+    /*digital clock display of the time*/
+    Serial.print("Time: ");
+    Serial.print(hour());
+    printDigits(minute());
+    printDigits(second());
+    Serial.print(" ");
+    Serial.print(day());
+    Serial.print(".");
+    Serial.print(month());
+    Serial.print(".");
+    Serial.print(year());
+    Serial.println();
 }
 
-void sendDataToDB(void)
+void printDigits(int digits)
 {
-    InfluxData data_power = measurePower();
-    influx.prepare(data_power);
+  /*utility for digital clock display: prints preceding colon and leading 0*/
+    Serial.print(":");
+    if (digits < 10) Serial.print('0');
+    Serial.print(digits);
+}
 
-    InfluxData data_environment = measureEnvironment();
-    influx.prepare(data_environment);
+/*
+ *Publish values based on mqtt topic
+ */
+void mqtt_publish_topic(void)
+{
+    measurePower();
+    measureEnvironment();
 
-    // only with this call all prepared measurements are sent
-    influx.write();
+    String publish_values = "esp8266_energy_meter,location=outside,device=";
+           publish_values += String(_clientId);
+           publish_values += " ";
+           publish_values += "voltage=";
+           publish_values += String(voltage);
+           publish_values += ",current=";
+           publish_values += String(current);
+           publish_values += ",power=";
+           publish_values += String(power);
+           publish_values += ",temperature=";
+           publish_values += String(temperature);
+           publish_values += ",humidity=";
+           publish_values += String(humidity);
+           publish_values += ",pressure=";
+           publish_values += String(pressure);
+           publish_values += ",light=";
+           publish_values += String(light);
+           publish_values += ",millis=";
+           publish_values += String(millis());
+
+    /*esp8266_energy_meter,location=outside,device=ESP8266Client-01 voltage=216,current=0.12,power=25.92,temperature=32,humidity=43,pressure=12,light=52*/
+
+    mqtt.publish(_mqtt_topic_values, publish_values.c_str(), publish_values.length());
 }
 
 /**
    Just create a random measurement.
 */
-InfluxData measurePower(void)
+void measurePower(void)
 {
-    int voltage = random(210, 225);
-    float current = 0.12;
-    float power = voltage * current;
+    voltage = random(210, 225);
+    current = 0.12;
+    power = voltage * current;
 
-    Serial.printf("Voltage: %d, Current:%f, Power: %f", voltage, current, power);
-
-    InfluxData row("data_power");
-    row.addTag("location", "outside");
-    row.addTag("sensor", "one");
-    row.addTag("user", "esp8266");
-    row.addValue("voltage", voltage);
-    row.addValue("current", current);
-    row.addValue("power", power);
-    return row;
+    Serial.printf("Voltage: %d, Current:%f, Power: %f\n", voltage, current, power);
 }
 
-InfluxData measureEnvironment(void)
+void measureEnvironment(void)
 {
-    float temperature = random(30, 35);
-    float humidity = random(40, 45);
-    float pressure = random(11, 17);
-    float light = random(43, 60);
+    temperature = random(30, 35);
+    humidity = random(40, 45);
+    pressure = random(11, 17);
+    light = random(43, 60);
 
-    InfluxData row("data_environment");
-    row.addTag("location", "outside");
-    row.addTag("sensor", "one");
-    row.addTag("user", "esp8266");
-    row.addValue("temperature", temperature);
-    row.addValue("humidity", humidity);
-    row.addValue("pressure", pressure);
-    row.addValue("light", light);
-    return row;
+    Serial.printf("Temperature: %d, Humidity: %d, Pressure: %d, Light: %d\n",
+                    temperature, humidity, pressure, light);
+}
+
+/*
+ *MQTT callback on messages
+ */
+void mqtt_callback(char* topic, byte* payload, unsigned int length)
+{
+    String message;
+    for (unsigned int i = 0; i < length; i++) {
+        message += (char)payload[i];
+    }
+    Serial.printf("Message arrived [%s] %s\n", topic, message.c_str());
+}
+
+void mqtt_reconnect(void)
+{
+    /*Loop until we're reconnected*/
+    while (!mqtt.connected()) {
+        Serial.print("Attempting MQTT connection...");
+        if (mqtt.connect(_clientId))
+        {
+            Serial.println("connected");
+            /*Once connected, publish an announcement...*/
+            mqtt.publish(_mqtt_topic_connected, _clientId);
+            /*... and resubscribe*/
+            mqtt.subscribe(_mqtt_topic_command);
+        }
+        else
+        {
+            Serial.print("failed, rc=");
+            Serial.print(mqtt.state());
+            Serial.println(" try again in 5 seconds");
+            /*Wait 5 seconds before retrying*/
+            delay(5000);
+        }
+    }
+}
+
+const int NTP_PACKET_SIZE = 48; // NTP time is in the first 48 bytes of message
+byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming & outgoing packets
+
+time_t getNtpTime()
+{
+    IPAddress ntpServerIP; /*NTP server's ip address*/
+
+    while (ntp_udp.parsePacket() > 0) ; /*discard any previously received packets*/
+    Serial.println("Transmit NTP Request");
+    /*get ip address of domain name*/
+    WiFi.hostByName(_ntp_server_name, ntpServerIP);
+    Serial.print(_ntp_server_name);
+    Serial.print(": ");
+    Serial.println(ntpServerIP);
+    sendNTPpacket(ntpServerIP);
+    uint32_t beginWait = millis();
+    while (millis() - beginWait < 1500)
+    {
+        int size = ntp_udp.parsePacket();
+        if (size >= NTP_PACKET_SIZE)
+        {
+            Serial.println("Receive NTP Response");
+            ntp_udp.read(packetBuffer, NTP_PACKET_SIZE);
+            unsigned long secsSince1900;
+            /*convert four bytes starting at location 40 to a long integer*/
+            secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
+            secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
+            secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
+            secsSince1900 |= (unsigned long)packetBuffer[43];
+            return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
+        }
+    }
+    Serial.println("No NTP Response :-(");
+    return 0; // return 0 if unable to get the time
+}
+
+/*send an NTP request to the time server at the given address*/
+void sendNTPpacket(IPAddress &address)
+{
+    /*set all bytes in the buffer to 0*/
+    memset(packetBuffer, 0, NTP_PACKET_SIZE);
+    /*Initialize values needed to form NTP request*/
+    packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+    packetBuffer[1] = 0;     // Stratum, or type of clock
+    packetBuffer[2] = 6;     // Polling Interval
+    packetBuffer[3] = 0xEC;  // Peer Clock Precision
+    // 8 bytes of zero for Root Delay & Root Dispersion
+    packetBuffer[12] = 49;
+    packetBuffer[13] = 0x4E;
+    packetBuffer[14] = 49;
+    packetBuffer[15] = 52;
+    // all NTP fields have been given values, now
+    // you can send a packet requesting a timestamp:
+    ntp_udp.beginPacket(address, 123); //NTP requests are to port 123
+    ntp_udp.write(packetBuffer, NTP_PACKET_SIZE);
+    ntp_udp.endPacket();
 }

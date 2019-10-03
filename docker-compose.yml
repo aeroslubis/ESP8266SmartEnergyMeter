@@ -9,33 +9,31 @@ services:
         environment:
             - INFLUXDB_USER=root
             - INFLUXDB_PASS=root
+        restart: always
 
     telegraf:
         container_name: power_meter_telegraf
         image: telegraf
-        environment:
-            - HOST_PROC=/host/proc
-        privileged: true
-        network_mode: "service:influxdb"
+        network_mode: "host"
         volumes:
-            - /proc:/host/proc:ro
             - ./etc/telegraf.conf:/etc/telegraf/telegraf.conf:ro
-        depends_on:
-            - influxdb
+            - /proc:/host/proc:ro
+            - /var/run/docker.sock:/var/run/docker.sock:ro
+        restart: always
 
     mosquitto:
         container_name: power_meter_mosquitto
         image: eclipse-mosquitto
+        user: "0"
+        network_mode: "telegraf"
         ports:
             - "1883:1883"
+        restart: always
 
     grafana:
         container_name: power_meter_grafana
         image: grafana/grafana
         environment:
             - NO_PROXY="influxdb"
-        network_mode: "service:influxdb"
         ports:
             - "3000:3000"
-        depends_on:
-            - telegraf
