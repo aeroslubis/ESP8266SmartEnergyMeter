@@ -4,6 +4,7 @@
 #include <TimeLib.h>
 #include <ArduinoOTA.h>
 #include <PubSubClient.h>
+#include <Syslog.h>
 #include "credentials.h"
 
 const char* _default_ssid = DEFAULT_SSID;
@@ -13,26 +14,24 @@ const char* _update_password = DEFAULT_UPDATE_PASSWORD;
 const char* _mqtt_server = MQTT_SERVER;
 const char* _ntp_server_name = NTP_SERVER_NAME;
 
-const char* _hostname = "ESP8266Client-01";
+const char* _hostname = DEVICE_HOSTNAME;
 
 /*MQTT Topics name*/
 const char* _mqtt_topic_command = "esp8266/energy_meter/command";
 const char* _mqtt_topic_connected = "esp8266/energy_meter/connected_client";
 const char* _mqtt_topic_values = "esp8266/energy_meter/values";
 
-/*const long utcOffsetInSeconds = 25200;*/
 const int timeZone = 7;
 unsigned long previousMillis;
-
 
 int voltage;
 float current, power;
 int temperature, humidity, pressure, light;
 
 WiFiClient espClient;
-WiFiUDP ntp_udp;
-/*NTPClient timeClient(ntp_udp, "asia.pool.ntp.org", utcOffsetInSeconds);*/
+WiFiUDP udpClient;
 PubSubClient mqtt(espClient);
+Syslog Syslog(udpClient, SYSLOG_PROTO_IETF);
 
 void setup()
 {
@@ -46,19 +45,24 @@ void setup()
         Serial.print (".");
     }
     Serial.println(" OK");
+    Syslog.logf(LOG_INFO, "WiFi connected to %s", _default_ssid);
 
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
     Serial.print("MAC Address: ");
     Serial.println(WiFi.macAddress().c_str());
+    Syslog.logf(LOG_INFO, "IP Address: %s MAC: %s",
+        WiFi.localIP().toString().c_str(), WiFi.macAddress().c_str());
 
     Serial.print("Starting mDNS responder...");
     if (!MDNS.begin("esp8266"))
     {
         Serial.println(" FAIL");
-        while (true) { delay(1000); }
+        Syslog.log(LOG_ERR, "mDNS fail to start");
+        /*while (true) { delay(1000); }*/
     }
     Serial.println(" OK");
+    Syslog.log(LOG_INFO, "mDNS started");
     MDNS.addService("http", "tcp", 80);
 
     /*
@@ -85,6 +89,7 @@ void setup()
          *NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
          */
         Serial.println("Start updating " + type);
+        Syslog.log(LOG_KERN, "Received OTA Update");
     });
 
     ArduinoOTA.onEnd([]()
@@ -109,14 +114,25 @@ void setup()
 
     ArduinoOTA.begin();
 
-    ntp_udp.begin(1337);
+    udpClient.begin(1337);
 
     /*timeClient.begin();*/
     setSyncProvider(getNtpTime);
     setSyncInterval(300);
 
+    /*
+     *Setup mqtt server and callback
+     */
     mqtt.setServer(_mqtt_server, 1883);
     mqtt.setCallback(mqtt_callback);
+
+    /*
+     *Setup Syslog server address and port
+     */
+    Syslog.server(SYSLOG_SERVER, SYSLOG_PORT);
+    Syslog.deviceHostname(DEVICE_HOSTNAME);
+    Syslog.appName(APP_NAME);
+    Syslog.defaultPriority(LOG_KERN);
 
     /*
      *ESP8266 Builtin LED
@@ -177,7 +193,7 @@ void mqtt_publish_topic(void)
     measureEnvironment();
 
     String publish_values = "esp8266_energy_meter,location=outside,device=";
-           publish_values += String(_clientId);
+           publish_values += String(_hostname);
            publish_values += " ";
            publish_values += "voltage=";
            publish_values += String(voltage);
@@ -199,6 +215,7 @@ void mqtt_publish_topic(void)
     /*esp8266_energy_meter,location=outside,device=ESP8266Client-01 voltage=216,current=0.12,power=25.92,temperature=32,humidity=43,pressure=12,light=52*/
 
     mqtt.publish(_mqtt_topic_values, publish_values.c_str(), publish_values.length());
+    Syslog.log(LOG_INFO, publish_values);
 }
 
 /**
@@ -211,6 +228,7 @@ void measurePower(void)
     power = voltage * current;
 
     Serial.printf("Voltage: %d, Current:%f, Power: %f\n", voltage, current, power);
+    Syslog.logf(LOG_INFO,"Voltage: %d, Current:%f, Power: %f\n", voltage, current, power);
 }
 
 void measureEnvironment(void)
@@ -221,6 +239,8 @@ void measureEnvironment(void)
     light = random(43, 60);
 
     Serial.printf("Temperature: %d, Humidity: %d, Pressure: %d, Light: %d\n",
+                    temperature, humidity, pressure, light);
+    Syslog.logf(LOG_INFO, "Temperature: %d, Humidity: %d, Pressure: %d, Light: %d\n",
                     temperature, humidity, pressure, light);
 }
 
@@ -234,6 +254,7 @@ void mqtt_callback(char* topic, byte* payload, unsigned int length)
         message += (char)payload[i];
     }
     Serial.printf("Message arrived [%s] %s\n", topic, message.c_str());
+    Syslog.logf(LOG_INFO, "Message arrived [%s] %s\n", topic, message.c_str());
 }
 
 void mqtt_reconnect(void)
@@ -241,11 +262,13 @@ void mqtt_reconnect(void)
     /*Loop until we're reconnected*/
     while (!mqtt.connected()) {
         Serial.print("Attempting MQTT connection...");
-        if (mqtt.connect(_clientId))
+        Syslog.log("Attempting MQTT connection...");
+        if (mqtt.connect(_hostname))
         {
             Serial.println("connected");
+            Syslog.log(LOG_INFO, "MQTT connected");
             /*Once connected, publish an announcement...*/
-            mqtt.publish(_mqtt_topic_connected, _clientId);
+            mqtt.publish(_mqtt_topic_connected, _hostname);
             /*... and resubscribe*/
             mqtt.subscribe(_mqtt_topic_command);
         }
@@ -254,6 +277,7 @@ void mqtt_reconnect(void)
             Serial.print("failed, rc=");
             Serial.print(mqtt.state());
             Serial.println(" try again in 5 seconds");
+            Syslog.logf(LOG_ERR, "MQTT connection failed rc=%d", mqtt.state());
             /*Wait 5 seconds before retrying*/
             delay(5000);
         }
@@ -267,7 +291,7 @@ time_t getNtpTime()
 {
     IPAddress ntpServerIP; /*NTP server's ip address*/
 
-    while (ntp_udp.parsePacket() > 0) ; /*discard any previously received packets*/
+    while (udpClient.parsePacket() > 0) ; /*discard any previously received packets*/
     Serial.println("Transmit NTP Request");
     /*get ip address of domain name*/
     WiFi.hostByName(_ntp_server_name, ntpServerIP);
@@ -278,11 +302,11 @@ time_t getNtpTime()
     uint32_t beginWait = millis();
     while (millis() - beginWait < 1500)
     {
-        int size = ntp_udp.parsePacket();
+        int size = udpClient.parsePacket();
         if (size >= NTP_PACKET_SIZE)
         {
             Serial.println("Receive NTP Response");
-            ntp_udp.read(packetBuffer, NTP_PACKET_SIZE);
+            udpClient.read(packetBuffer, NTP_PACKET_SIZE);
             unsigned long secsSince1900;
             /*convert four bytes starting at location 40 to a long integer*/
             secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
@@ -313,7 +337,7 @@ void sendNTPpacket(IPAddress &address)
     packetBuffer[15] = 52;
     // all NTP fields have been given values, now
     // you can send a packet requesting a timestamp:
-    ntp_udp.beginPacket(address, 123); //NTP requests are to port 123
-    ntp_udp.write(packetBuffer, NTP_PACKET_SIZE);
-    ntp_udp.endPacket();
+    udpClient.beginPacket(address, 123); //NTP requests are to port 123
+    udpClient.write(packetBuffer, NTP_PACKET_SIZE);
+    udpClient.endPacket();
 }
