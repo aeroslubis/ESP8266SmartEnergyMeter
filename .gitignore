@@ -2,3 +2,4 @@
 include/credentials.h
 lib/*
 !lib/.gitkeep
+.vscode

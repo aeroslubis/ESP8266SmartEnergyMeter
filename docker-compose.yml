@@ -26,8 +26,14 @@ services:
         image: eclipse-mosquitto
         user: "0"
         network_mode: "host"
+        volumes:
+            - ./etc/mosquitto.conf:/etc/mosquitto/mosquitto.conf:ro
+            - ./etc/mqtt-server.pem:/etc/mosquitto/mqtt-server.pem:ro
+            - ./etc/mqtt-server.crt:/etc/mosquitto/mqtt-server.crt:ro
+            - ./etc/ca.crt:/etc/mosquitto/ca.crt:ro
         ports:
             - "1883:1883"
+            - "8883:8883"
 
     grafana:
         container_name: power_meter_grafana

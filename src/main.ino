@@ -3,224 +3,125 @@
 #include <WiFiUdp.h>
 #include <TimeLib.h>
 #include <ArduinoOTA.h>
-#include <PubSubClient.h>
-#include <Syslog.h>
+#include <Ticker.h>
+#include <AsyncMqttClient.h>
 #include "credentials.h"
 
-const char* _default_ssid = DEFAULT_SSID;
-const char* _default_password = DEFAULT_PASSWORD;
-const char* _update_username = DEFAULT_UPDATE_USERNAME;
-const char* _update_password = DEFAULT_UPDATE_PASSWORD;
-const char* _mqtt_server = MQTT_SERVER;
-const char* _ntp_server_name = NTP_SERVER_NAME;
-
-const char* _hostname = DEVICE_HOSTNAME;
-
 /*MQTT Topics name*/
-const char* _mqtt_topic_command = "esp8266/energy_meter/command";
-const char* _mqtt_topic_connected = "esp8266/energy_meter/connected_client";
-const char* _mqtt_topic_values = "esp8266/energy_meter/values";
+#define MQTT_TOPIC_COMMAND "esp8266/energy_meter/command"
+#define MQTT_TOPIC_CONNECTED "esp8266/energy_meter/connected"
+#define MQTT_TOPIC_VALUES "esp8266/energy_meter/values"
 
-const int timeZone = 7;
-unsigned long previousMillis;
+#define NTP_TIME_ZONE 7
+#define LED_PIN D4 // ESP-12 builtin led
 
 int voltage;
 float current, power;
 int temperature, humidity, pressure, light;
+char thishost[15];
 
-WiFiClient espClient;
 WiFiUDP udpClient;
-PubSubClient mqtt(espClient);
-Syslog Syslog(udpClient, SYSLOG_PROTO_IETF);
+AsyncMqttClient mqttClient;
+WiFiEventHandler wifiConnectHandler;
+WiFiEventHandler wifiDisconnectHandler;
+Ticker mqttReconnectTimer;
+Ticker wifiReconnectTimer;
+Ticker mqttPublishTopicTimer;
+Ticker ledBlinkTimer;
 
 void setup()
 {
     Serial.begin(115200);
-    WiFi.begin(_default_ssid, _default_password);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH);
 
-    Serial.print("Connecting to WiFi");
-    while(WiFi.status() != WL_CONNECTED)
-    {
-        delay (500);
-        Serial.print (".");
+    /*Get device hostname*/
+    sprintf(thishost, "EMeter-%04X", ESP.getChipId() & 0xFFFF);
+    Serial.printf("Device Name: %s\n", thishost);
+
+    wifiConnectHandler = WiFi.onStationModeGotIP(onWifiConnect);
+    wifiDisconnectHandler = WiFi.onStationModeDisconnected(onWifiDisconnect);
+
+    mqttClient.onConnect(onMqttConnect);
+    mqttClient.onDisconnect(onMqttDisconnect);
+    mqttClient.onSubscribe(onMqttSubscribe);
+    mqttClient.onUnsubscribe(onMqttUnsubscribe);
+    mqttClient.onMessage(onMqttMessage);
+    mqttClient.onPublish(onMqttPublish);
+    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    mqttClient.setCredentials(MQTT_USERNAME, MQTT_PASSWORD);
+#if ASYNC_TCP_SSL_ENABLED
+    mqttClient.setSecure(MQTT_SECURE);
+    if (MQTT_SECURE) {
+        mqttClient.addServerFingerprint((const uint8_t[])MQTT_SERVER_FINGERPRINT);
     }
-    Serial.println(" OK");
-    Syslog.logf(LOG_INFO, "WiFi connected to %s", _default_ssid);
+#endif
+    mqttClient.setMaxTopicLength(200);
 
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-    Serial.print("MAC Address: ");
-    Serial.println(WiFi.macAddress().c_str());
-    Syslog.logf(LOG_INFO, "IP Address: %s MAC: %s",
-        WiFi.localIP().toString().c_str(), WiFi.macAddress().c_str());
+    connectToWifi();
 
-    Serial.print("Starting mDNS responder...");
-    if (!MDNS.begin("esp8266"))
-    {
-        Serial.println(" FAIL");
-        Syslog.log(LOG_ERR, "mDNS fail to start");
-        /*while (true) { delay(1000); }*/
-    }
-    Serial.println(" OK");
-    Syslog.log(LOG_INFO, "mDNS started");
-    MDNS.addService("http", "tcp", 80);
+    /*Wait for wifi connection for the first time device powered*/
+    while (WiFi.status() != WL_CONNECTED) { delay(50); }
 
-    /*
-     *Port defaults to 8266
-     */
-    ArduinoOTA.setPort(8266);
-
-    /*
-     *Hostname defaults OTA hostname and password
-     */
-    ArduinoOTA.setHostname("myesp8266");
-    ArduinoOTA.setPassword("admin");
-
-    /*
-     *Callback function during OTA operation
-     */
-    ArduinoOTA.onStart([]()
-    {
-        String type;
-        if (ArduinoOTA.getCommand() == U_FLASH) type = "sketch";
-        else type = "filesystem";
-
-        /*
-         *NOTE: if updating SPIFFS this would be the place to unmount SPIFFS using SPIFFS.end()
-         */
-        Serial.println("Start updating " + type);
-        Syslog.log(LOG_KERN, "Received OTA Update");
-    });
-
-    ArduinoOTA.onEnd([]()
-    {
-        Serial.println("\nEnd");
-    });
-
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
-    {
-        Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
-    });
-
-    ArduinoOTA.onError([](ota_error_t error)
-    {
-        Serial.printf("Error[%u]: ", error);
-        if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
-        else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
-        else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
-        else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
-        else if (error == OTA_END_ERROR) Serial.println("End Failed");
-    });
-
-    ArduinoOTA.begin();
-
-    udpClient.begin(1337);
-
-    /*timeClient.begin();*/
+    /*Setup ntp time sync*/
+    udpClient.begin(NTP_SERVER_PORT);
     setSyncProvider(getNtpTime);
-    setSyncInterval(300);
+    setSyncInterval(300); // Resync ntp every 5 minutes(300 secons)
 
-    /*
-     *Setup mqtt server and callback
-     */
-    mqtt.setServer(_mqtt_server, 1883);
-    mqtt.setCallback(mqtt_callback);
+    /*Hostname defaults OTA hostname and password*/
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    ArduinoOTA.setPort(OTA_PORT);
+    ArduinoOTA.setPassword(OTA_PASSWORD);
 
-    /*
-     *Setup Syslog server address and port
-     */
-    Syslog.server(SYSLOG_SERVER, SYSLOG_PORT);
-    Syslog.deviceHostname(DEVICE_HOSTNAME);
-    Syslog.appName(APP_NAME);
-    Syslog.defaultPriority(LOG_KERN);
-
-    /*
-     *ESP8266 Builtin LED
-     */
-    pinMode(D4, OUTPUT);
+    /*Callback function during OTA operation*/
+    ArduinoOTA.onStart(OTAonStart);
+    ArduinoOTA.onProgress(OTAonProgress);
+    ArduinoOTA.onEnd(OTAonEnd);
+    ArduinoOTA.onError(OTAonError);
+    ArduinoOTA.begin();
 }
 
 void loop()
 {
     ArduinoOTA.handle();
-
-    if (!mqtt.connected())
-    {
-        mqtt_reconnect();
-    }
-
-    mqtt.loop();
-
-    if (millis() > previousMillis + 5000)
-    {
-        previousMillis = millis();
-        digitalClockDisplay();
-        mqtt_publish_topic();
-        Serial.println("----------------------------");
-    }
 }
 
-void digitalClockDisplay(void)
+/*Publish values to mqtt broker*/
+void mqttPublishTopic(void)
 {
-    /*digital clock display of the time*/
-    Serial.print("Time: ");
-    Serial.print(hour());
-    printDigits(minute());
-    printDigits(second());
-    Serial.print(" ");
-    Serial.print(day());
-    Serial.print(".");
-    Serial.print(month());
-    Serial.print(".");
-    Serial.print(year());
-    Serial.println();
-}
-
-void printDigits(int digits)
-{
-  /*utility for digital clock display: prints preceding colon and leading 0*/
-    Serial.print(":");
-    if (digits < 10) Serial.print('0');
-    Serial.print(digits);
-}
-
-/*
- *Publish values based on mqtt topic
- */
-void mqtt_publish_topic(void)
-{
+    if (timeStatus() == timeSet) displayClock();
     measurePower();
     measureEnvironment();
 
-    String publish_values = "esp8266_energy_meter,location=outside,device=";
-           publish_values += String(_hostname);
-           publish_values += " ";
-           publish_values += "voltage=";
-           publish_values += String(voltage);
-           publish_values += ",current=";
-           publish_values += String(current);
-           publish_values += ",power=";
-           publish_values += String(power);
-           publish_values += ",temperature=";
-           publish_values += String(temperature);
-           publish_values += ",humidity=";
-           publish_values += String(humidity);
-           publish_values += ",pressure=";
-           publish_values += String(pressure);
-           publish_values += ",light=";
-           publish_values += String(light);
-           publish_values += ",millis=";
-           publish_values += String(millis());
+    String payload((char *)0);
+    payload.reserve(160); /*Reserve 160(146 recuired) byte of memory*/
 
-    /*esp8266_energy_meter,location=outside,device=ESP8266Client-01 voltage=216,current=0.12,power=25.92,temperature=32,humidity=43,pressure=12,light=52*/
+    payload += "esp8266_energy_meter,location=outside,device=";
+    payload += (String)thishost;
+    payload += " ";
+    payload += "voltage=";
+    payload += String(voltage);
+    payload += ",current=";
+    payload += String(current);
+    payload += ",power=";
+    payload += String(power);
+    payload += ",temperature=";
+    payload += String(temperature);
+    payload += ",humidity=";
+    payload += String(humidity);
+    payload += ",pressure=";
+    payload += String(pressure);
+    payload += ",light=";
+    payload += String(light);
 
-    mqtt.publish(_mqtt_topic_values, publish_values.c_str(), publish_values.length());
-    Syslog.log(LOG_INFO, publish_values);
+    Serial.println("------------------------");
+
+    /*Param @topic, @qos, @retain, @message, @message, length*/
+    mqttClient.publish(MQTT_TOPIC_VALUES, 0, false, payload.c_str(), payload.length());
+    ledBlinkTimer.attach_ms(50, blinkLed, 6);
 }
 
-/**
-   Just create a random measurement.
-*/
+/*Measure sensor data*/
 void measurePower(void)
 {
     voltage = random(210, 225);
@@ -228,7 +129,6 @@ void measurePower(void)
     power = voltage * current;
 
     Serial.printf("Voltage: %d, Current:%f, Power: %f\n", voltage, current, power);
-    Syslog.logf(LOG_INFO,"Voltage: %d, Current:%f, Power: %f\n", voltage, current, power);
 }
 
 void measureEnvironment(void)
@@ -236,66 +136,159 @@ void measureEnvironment(void)
     temperature = random(30, 35);
     humidity = random(40, 45);
     pressure = random(11, 17);
-    light = random(43, 60);
+    light = random(43, 50);
 
     Serial.printf("Temperature: %d, Humidity: %d, Pressure: %d, Light: %d\n",
                     temperature, humidity, pressure, light);
-    Syslog.logf(LOG_INFO, "Temperature: %d, Humidity: %d, Pressure: %d, Light: %d\n",
-                    temperature, humidity, pressure, light);
 }
 
-/*
- *MQTT callback on messages
+/*Async functions*/
+void connectToWifi(void)
+{
+    Serial.println("Connecting to WiFi");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    ledBlinkTimer.attach_ms(500, blinkLed, 0);
+}
+
+void connectToMqtt(void)
+{
+    Serial.print("Connecting to MQTT");
+#if ASYNC_TCP_SSL_ENABLED
+    Serial.println(" with SSL");
+#else
+    Serial.println();
+#endif
+
+    mqttClient.connect();
+}
+
+void onWifiConnect(const WiFiEventStationModeGotIP& event)
+{
+    Serial.printf("  WiFi connected to %s\n", WIFI_SSID);
+    Serial.print("  IP Address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("  MAC Address: ");
+    Serial.println(WiFi.macAddress().c_str());
+
+    /*Disable wifi connect led timer*/
+    ledBlinkTimer.detach();
+    digitalWrite(LED_PIN, HIGH);
+
+    connectToMqtt();
+}
+
+void onWifiDisconnect(const WiFiEventStationModeDisconnected& event)
+{
+    Serial.println("Disconnected from WiFi.");
+    mqttReconnectTimer.detach();
+    wifiReconnectTimer.once(2, connectToWifi);
+    ledBlinkTimer.attach_ms(500, blinkLed, 0);
+}
+
+void onMqttConnect(bool sessionPresent)
+{
+    Serial.println("Connected to MQTT.");
+    mqttClient.subscribe(MQTT_TOPIC_COMMAND, 1);
+    mqttClient.publish(MQTT_TOPIC_CONNECTED, 0, true, "connected");
+    mqttPublishTopicTimer.attach(10, mqttPublishTopic);
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason)
+{
+    Serial.println("Disconnected from MQTT.");
+
+    if (reason == AsyncMqttClientDisconnectReason::TLS_BAD_FINGERPRINT)
+    {
+        Serial.println("Bad server fingerprint.");
+    }
+
+    if (WiFi.isConnected())
+    {
+        mqttReconnectTimer.once(2, connectToMqtt);
+    }
+    /*Stop sending data to server*/
+    mqttPublishTopicTimer.detach();
+}
+
+void onMqttSubscribe(uint16_t packetId, uint8_t qos)
+{
+    Serial.printf("Packet [%d] Qos [%d] Subscribe acknowledged.\n", packetId, qos);
+}
+
+void onMqttUnsubscribe(uint16_t packetId)
+{
+    Serial.printf("Packet [%d] Unsubscribe acknowledged.\n", packetId);
+}
+
+void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties,
+                   size_t len, size_t index, size_t total)
+{
+    char message[len+1];
+    strncpy(message, payload, len);
+    message[len] = '\0';
+
+    Serial.printf("Message [%d] Topic: %s Payload: %s\n", index, topic, message);
+
+    if ((String)message == "relay")
+    {
+        Serial.println("relay on");
+    }
+}
+
+/*Async function executed when publish is acknowledged
+ *when using qos 1 or 2
  */
-void mqtt_callback(char* topic, byte* payload, unsigned int length)
+void onMqttPublish(uint16_t packetId)
 {
-    String message;
-    for (unsigned int i = 0; i < length; i++) {
-        message += (char)payload[i];
-    }
-    Serial.printf("Message arrived [%s] %s\n", topic, message.c_str());
-    Syslog.logf(LOG_INFO, "Message arrived [%s] %s\n", topic, message.c_str());
+    Serial.printf("Packet [%d] Publish acknowkledged.\n", packetId);
 }
 
-void mqtt_reconnect(void)
+void OTAonStart(void)
 {
-    /*Loop until we're reconnected*/
-    while (!mqtt.connected()) {
-        Serial.print("Attempting MQTT connection...");
-        Syslog.log("Attempting MQTT connection...");
-        if (mqtt.connect(_hostname))
-        {
-            Serial.println("connected");
-            Syslog.log(LOG_INFO, "MQTT connected");
-            /*Once connected, publish an announcement...*/
-            mqtt.publish(_mqtt_topic_connected, _hostname);
-            /*... and resubscribe*/
-            mqtt.subscribe(_mqtt_topic_command);
-        }
-        else
-        {
-            Serial.print("failed, rc=");
-            Serial.print(mqtt.state());
-            Serial.println(" try again in 5 seconds");
-            Syslog.logf(LOG_ERR, "MQTT connection failed rc=%d", mqtt.state());
-            /*Wait 5 seconds before retrying*/
-            delay(5000);
-        }
-    }
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) type = "sketch";
+    else type = "filesystem";
+    Serial.println("Start updating " + type);
+}
+
+void OTAonProgress(unsigned int progress, unsigned int total)
+{
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+}
+
+void OTAonError(ota_error_t error)
+{
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+}
+
+void OTAonEnd(void)
+{
+    Serial.println("\nEnd");
+}
+
+void displayClock(void)
+{
+    Serial.printf("Time: %d:%d:%d %d.%d.%d\n", hour(), minute(), second(),
+                  day(), month(), year());
 }
 
 const int NTP_PACKET_SIZE = 48; // NTP time is in the first 48 bytes of message
 byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming & outgoing packets
 
-time_t getNtpTime()
+time_t getNtpTime(void)
 {
     IPAddress ntpServerIP; /*NTP server's ip address*/
 
     while (udpClient.parsePacket() > 0) ; /*discard any previously received packets*/
     Serial.println("Transmit NTP Request");
     /*get ip address of domain name*/
-    WiFi.hostByName(_ntp_server_name, ntpServerIP);
-    Serial.print(_ntp_server_name);
+    WiFi.hostByName(NTP_SERVER_NAME, ntpServerIP);
+    Serial.print(NTP_SERVER_NAME);
     Serial.print(": ");
     Serial.println(ntpServerIP);
     sendNTPpacket(ntpServerIP);
@@ -313,11 +306,11 @@ time_t getNtpTime()
             secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
             secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
             secsSince1900 |= (unsigned long)packetBuffer[43];
-            return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
+            return secsSince1900 - 2208988800UL + NTP_TIME_ZONE * SECS_PER_HOUR;
         }
     }
     Serial.println("No NTP Response :-(");
-    return 0; // return 0 if unable to get the time
+    return 0;
 }
 
 /*send an NTP request to the time server at the given address*/
@@ -340,4 +333,20 @@ void sendNTPpacket(IPAddress &address)
     udpClient.beginPacket(address, 123); //NTP requests are to port 123
     udpClient.write(packetBuffer, NTP_PACKET_SIZE);
     udpClient.endPacket();
+}
+
+int blinkCount = 1;
+void blinkLed(const int numBlink)
+{
+    if (digitalRead(LED_PIN) == HIGH) digitalWrite(LED_PIN, LOW);
+    else digitalWrite(LED_PIN, HIGH);
+
+    if (numBlink == 0) return;
+    blinkCount++;
+    if (blinkCount > numBlink)
+    {
+        blinkCount = 1;
+        digitalWrite(LED_PIN, HIGH);
+        ledBlinkTimer.detach();
+    }
 }
